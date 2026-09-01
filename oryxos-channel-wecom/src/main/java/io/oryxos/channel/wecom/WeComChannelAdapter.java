@@ -98,7 +98,7 @@ public class WeComChannelAdapter implements InboundChannelAdapter {
     reconnectAttempt = 0;
     cancelReconnectLocked();
     try {
-      connectLocked();
+      wsRef.set(connect());
       state = ChannelStatus.State.CONNECTED;
       lastError = null;
       LOG.info("企微渠道 {} 长连接已建立（Agent: {}）", sanitize(config.name()), sanitize(config.agent()));
@@ -151,7 +151,7 @@ public class WeComChannelAdapter implements InboundChannelAdapter {
     return Math.min(RECONNECT_BASE_MS * (1L << capped), RECONNECT_MAX_MS);
   }
 
-  private void connectLocked() throws Exception {
+  private WeComWsClient connect() throws Exception {
     normalizer = new WeComEventNormalizer(config.name());
     WeComWsClient client =
         new WeComWsClient(
@@ -164,7 +164,7 @@ public class WeComChannelAdapter implements InboundChannelAdapter {
         new WeComMessageSender(
             client::sendJson, guard, OUTBOUND_URL, WeComMessageSender.DEFAULT_CHUNK_SIZE);
     client.connectAndSubscribe(START_TIMEOUT);
-    wsRef.set(client);
+    return client;
   }
 
   private void handleDisconnected() {
@@ -200,13 +200,14 @@ public class WeComChannelAdapter implements InboundChannelAdapter {
       if (!running) {
         return;
       }
-      try {
-        connectLocked();
-        reconnectAttempt = 0;
-        state = ChannelStatus.State.CONNECTED;
-        lastError = null;
-        LOG.info("企微渠道 {} 长连接已恢复", sanitize(config.name()));
-      } catch (Exception e) {
+    }
+    // 建连放锁外：connectAndSubscribe 最坏阻塞 ~40s（连接 20s + 订阅 20s），
+    // 锁内执行会把 stop() / 管理端停用渠道卡到建连结束
+    WeComWsClient client;
+    try {
+      client = connect();
+    } catch (Exception e) {
+      synchronized (this) {
         reconnectAttempt++;
         lastError = "长连接重连失败: " + sanitize(e.getMessage());
         LOG.warn(
@@ -214,8 +215,21 @@ public class WeComChannelAdapter implements InboundChannelAdapter {
             sanitize(config.name()),
             reconnectAttempt,
             sanitize(lastError));
-        scheduleReconnect();
       }
+      scheduleReconnect();
+      return;
+    }
+    synchronized (this) {
+      if (!running) {
+        // 建连期间被 stop：新连接就地关闭，不交字段（防幽灵连接）
+        client.closeQuietly();
+        return;
+      }
+      wsRef.set(client);
+      reconnectAttempt = 0;
+      state = ChannelStatus.State.CONNECTED;
+      lastError = null;
+      LOG.info("企微渠道 {} 长连接已恢复", sanitize(config.name()));
     }
   }
 
